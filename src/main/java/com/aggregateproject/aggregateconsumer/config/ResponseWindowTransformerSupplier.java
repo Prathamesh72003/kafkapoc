@@ -15,12 +15,18 @@ import org.springframework.util.StringUtils;
 import java.time.Duration;
 import java.util.*;
 
+/**
+ * Transformer supplier that groups responses per transaction using a logical
+ * window start obtained from DB (transaction start time). Expiration is based
+ * on last-seen event time so windows won't be immediately expired if DB start
+ * time is in the past.
+ */
 public class ResponseWindowTransformerSupplier implements ValueTransformerWithKeySupplier<String, String, String> {
 
     private final TransactionFinalizerService finalizer;
     private final ObjectMapper mapper;
 
-    // 5 minutes window
+    // window length (business), e.g. 2 minutes
     private static final long WINDOW_SIZE_MS = Duration.ofMinutes(2).toMillis();
 
     public ResponseWindowTransformerSupplier(TransactionFinalizerService finalizer, ObjectMapper mapper) {
@@ -44,6 +50,26 @@ public class ResponseWindowTransformerSupplier implements ValueTransformerWithKe
                 this.windowStore = (KeyValueStore<String, String>) context.getStateStore(WINDOW_STORE_NAME);
                 this.closedStore = (KeyValueStore<String, String>) context.getStateStore(CLOSED_STORE_NAME);
 
+                System.out.println("---- Active Window Store Entries ----");
+                try (KeyValueIterator<String, String> it = windowStore.all()) {
+                    while (it.hasNext()) {
+                        KeyValue<String, String> kv = it.next();
+                        System.out.printf("WINDOW [%s] -> %s%n", kv.key, kv.value);
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+
+                System.out.println("---- Closed Store Entries ----");
+                try (KeyValueIterator<String, String> it = closedStore.all()) {
+                    while (it.hasNext()) {
+                        KeyValue<String, String> kv = it.next();
+                        System.out.printf("CLOSED [%s] -> %s%n", kv.key, kv.value);
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+
                 // schedule punctuator every 30 seconds to check for expired windows
                 this.context.schedule(Duration.ofSeconds(30), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
                     try {
@@ -52,19 +78,18 @@ public class ResponseWindowTransformerSupplier implements ValueTransformerWithKe
                             List<String> toRemove = new ArrayList<>();
                             while (iter.hasNext()) {
                                 KeyValue<String, String> kv = iter.next();
-                                String storeKey = kv.key; // transactionId|windowStart
+                                String storeKey = kv.key; // transactionId|logicalWindowStart
                                 String[] parts = storeKey.split("\\|");
                                 if (parts.length != 2) continue;
                                 String txnId = parts[0];
-                                long windowStart = Long.parseLong(parts[1]);
-                                long windowEnd = windowStart + WINDOW_SIZE_MS;
+                                // parse wrapper (lastSeen + responses)
+                                WindowWrapper wrapper = deserializeWrapper(kv.value);
+                                long lastSeen = wrapper.lastSeen;
+                                long windowEnd = lastSeen + WINDOW_SIZE_MS; // expiry relative to last seen
                                 if (windowEnd <= now) {
                                     // finalize if not yet closed
                                     if (closedStore.get(txnId) == null) {
-                                        Map<String, ResponseMessage> map = deserializeMap(kv.value);
-                                        // finalize DB
-                                        finalizer.finalizeTransaction(txnId, map);
-                                        // mark closed
+                                        finalizer.finalizeTransaction(txnId, wrapper.responses);
                                         closedStore.put(txnId, "CLOSED");
                                     }
                                     // remove the window store entry to save space
@@ -75,7 +100,6 @@ public class ResponseWindowTransformerSupplier implements ValueTransformerWithKe
                             for (String k : toRemove) windowStore.delete(k);
                         }
                     } catch (Exception ex) {
-                        // log
                         System.err.println("Error during punctuate: " + ex.getMessage());
                         ex.printStackTrace();
                     }
@@ -93,75 +117,73 @@ public class ResponseWindowTransformerSupplier implements ValueTransformerWithKe
 
                 // if transaction already closed => reject/log and do nothing
                 if (closedStore.get(txnId) != null) {
-                    // log or send to DLQ - here we just print
                     System.out.printf("Received message for closed transaction %s - rejecting%n", txnId);
                     return value;
                 }
 
-                long ts = context.timestamp(); // message timestamp
-                long windowStart = (ts / WINDOW_SIZE_MS) * WINDOW_SIZE_MS;
-
-                long windowEnd = windowStart + WINDOW_SIZE_MS;
-                if (ts >= windowEnd) {
-                    // message is outside (late beyond window) -> reject
-                    System.out.printf("Late message for txn %s, ts=%d, windowEnd=%d - rejecting%n", txnId, ts, windowEnd);
-                    return value;
+                long eventTs = context.timestamp(); // event timestamp (processing uses this as lastSeen)
+                // fetch DB logical window start (epoch millis). Falls back to event time when absent.
+                Long logicalStartMillis = null;
+                try {
+                    logicalStartMillis = finalizer.getTransactionStartEpochMillis(txnId);
+                } catch (Exception e) {
+                    System.err.println("Error fetching transaction start time from DB: " + e.getMessage());
+                }
+                if (logicalStartMillis == null) {
+                    // fallback to event-time-aligned bucket
+                    long windowStart = (eventTs / WINDOW_SIZE_MS) * WINDOW_SIZE_MS;
+                    logicalStartMillis = windowStart;
                 }
 
-                // store key: txnId|windowStart
-                String storeKey = txnId + "|" + windowStart;
-                String existing = windowStore.get(storeKey);
-                Map<String, ResponseMessage> map = existing == null ? new HashMap<>() : deserializeMap(existing);
+                // compute store key using logical start from DB (so all events for txn map to same logical window)
+                String storeKey = txnId + "|" + logicalStartMillis;
 
+                // read existing wrapper (responses + lastSeen)
+                String existing = windowStore.get(storeKey);
+                WindowWrapper wrapper = existing == null ? new WindowWrapper() : deserializeWrapper(existing);
+
+                // If this event's timestamp is after lastSeen, update lastSeen
+                if (eventTs > wrapper.lastSeen) wrapper.lastSeen = eventTs;
+
+                // reject if the event timestamp is so late that it's beyond expiry relative to lastSeen prior to update
+                // (we already updated lastSeen using this event, so we need a different check: use previous lastSeen before update)
+                // To keep semantics strict: compute windowEnd based on previous lastSeen (if any), else accept.
+                // We'll allow the event itself to extend the lastSeen; the punctuator handles finalization.
+
+                // parse incoming payload to ResponseMessage
                 ResponseMessage resp;
                 try {
-                    String cleaned = value.trim();
-
-                    // If payload is quoted JSON (e.g. "{\"amount\":120,...}") -> strip quotes
+                    String cleaned = value == null ? "" : value.trim();
                     if (cleaned.startsWith("\"") && cleaned.endsWith("\"")) {
                         cleaned = cleaned.substring(1, cleaned.length() - 1);
                     }
-
-                    // Replace escaped quotes to restore valid JSON
                     cleaned = cleaned.replace("\\\"", "\"");
-
                     resp = mapper.readValue(cleaned, ResponseMessage.class);
                 } catch (Exception e) {
                     System.err.println("Failed to parse incoming message json: " + e.getMessage());
                     return value;
                 }
 
-
                 // put response into map (latest wins for same requestId inside window)
-                map.put(resp.getRequestId(), resp);
-                windowStore.put(storeKey, serializeMap(map));
+                wrapper.responses.put(resp.getRequestId(), resp);
 
-                // check expected set from DB by calling finalizer.service's repository indirectly
-                // Note: transactionFinalizerService will call the repository inside finalizeTransaction.
-                // Here we need to know expected count, so we fetch it using a small hack: call finalizer repository method via reflection? No.
-                // Instead, we rely on finalizer to provide a small helper via public API: we can't change that now.
-                // Simpler approach: ask finalizer to check completeness by fetching expected set size using DB.
-                // We'll implement a small completeness-check by calling a new method on finalizer that returns expectedSize.
-                // But to avoid changing class signatures now, we'll perform completeness detection by trying to finalize only if sizes match.
-                // So for simplicity we'll fetch expected set by invoking a finalizer helper if available. But since we can't here,
-                // we will rely on a small behavior: finalizer cannot be invoked until punctuator runs. To honor early-finalization requirement,
-                // we attempt to detect expected set size by calling a repository via finalizer using reflection fallback.
+                // persist updated wrapper (with updated lastSeen)
+                windowStore.put(storeKey, serializeWrapper(wrapper));
+
+                // Early-finalization: check expected set from DB
                 boolean completeEarly = false;
                 try {
-                    // try to call finalizer.getExpectedRequestIds(txnId) if exists
                     Set<String> expected = finalizer.getExpectedRequestIds(txnId);
-                    if (expected != null && expected.size() == map.size()) {
+                    if (expected != null && expected.size() == wrapper.responses.size()) {
                         completeEarly = true;
                     }
-
                 } catch (Exception e) {
                     System.err.println("Error while checking expected set: " + e.getMessage());
                 }
 
                 if (completeEarly) {
-                    // finalize now
                     try {
-                        finalizer.finalizeTransaction(txnId, map);
+                        finalizer.finalizeTransaction(txnId, wrapper.responses);
                         closedStore.put(txnId, "CLOSED");
                         // remove window store entry
                         windowStore.delete(storeKey);
@@ -170,8 +192,7 @@ public class ResponseWindowTransformerSupplier implements ValueTransformerWithKe
                     }
                 }
 
-                // We don't forward transformed records downstream (this transformer returns the original value)
-                // Returning null would drop it, but we return the original value to keep the stream semantics.
+                // return original value (we are not altering downstream messages)
                 return value;
             }
 
@@ -180,24 +201,32 @@ public class ResponseWindowTransformerSupplier implements ValueTransformerWithKe
                 // nothing
             }
 
-            private String serializeMap(Map<String, ResponseMessage> map) {
+            // wrapper helpers ------------------------------------------------
+
+            private String serializeWrapper(WindowWrapper w) {
                 try {
-                    return mapper.writeValueAsString(map);
+                    return mapper.writeValueAsString(w);
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }
             }
 
-            private Map<String, ResponseMessage> deserializeMap(String json) {
+            private WindowWrapper deserializeWrapper(String json) {
                 try {
-                    if (json == null) return new HashMap<>();
-                    return mapper.readValue(json, new TypeReference<Map<String, ResponseMessage>>() {});
+                    if (json == null || json.isEmpty()) return new WindowWrapper();
+                    // generic map to wrapper (we rely on Jackson's binding)
+                    return mapper.readValue(json, WindowWrapper.class);
                 } catch (Exception e) {
-                    System.err.println("Failed to deserialize map: " + e.getMessage());
-                    return new HashMap<>();
+                    System.err.println("Failed to deserialize wrapper: " + e.getMessage());
+                    return new WindowWrapper();
                 }
             }
         };
     }
-}
 
+    // simple helper holder class (serialized as JSON into state store)
+    private static class WindowWrapper {
+        public long lastSeen = 0L;
+        public Map<String, ResponseMessage> responses = new HashMap<>();
+    }
+}
