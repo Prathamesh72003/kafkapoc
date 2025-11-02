@@ -8,7 +8,7 @@ import jakarta.transaction.Transactional;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.time.ZoneOffset;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -24,25 +24,15 @@ public class TransactionFinalizerService {
         this.mapper = mapper;
     }
 
-    /**
-     * Finalize a transaction window: update req_res rows based on provided responses map.
-     *
-     * This method is transactional and intended to be idempotent (writing same values repetitively is OK).
-     *
-     * @param transactionId transaction id
-     * @param responses map requestId -> ResponseMessage (only responses collected within window)
-     */
     @Transactional
     public void finalizeTransaction(String transactionId, Map<String, ResponseMessage> responses) {
         System.out.println("Finalizing transaction: " + transactionId);
         List<RequestResponse> rows = repository.findByTransactionId(transactionId);
 
-        // If no rows for that transaction => nothing to do
         if (rows == null || rows.isEmpty()) {
             return;
         }
 
-        // update each row depending on whether a response was provided
         for (RequestResponse row : rows) {
             ResponseMessage resp = responses.get(row.getRequestId());
             if (resp != null) {
@@ -53,7 +43,6 @@ public class TransactionFinalizerService {
                 }
                 row.setTaxRate(resp.getTaxRate());
             } else {
-                // missing response -> default values
                 row.setResJson(null);
                 row.setTaxRate(5.0);
             }
@@ -61,9 +50,6 @@ public class TransactionFinalizerService {
         }
     }
 
-    /**
-     * Returns the expected requestIds for the given transaction.
-     */
     public Set<String> getExpectedRequestIds(String transactionId) {
         List<RequestResponse> rows = repository.findByTransactionId(transactionId);
         if (rows == null) return Collections.emptySet();
@@ -72,16 +58,19 @@ public class TransactionFinalizerService {
 
     /**
      * Return the transaction's start time as epoch milli according to the existing req_res rows.
-     * We assume that the request rows for the same transaction share the same startTime (created earlier).
-     * If none available, returns null (caller should fall back).
+     *
+     * IMPORTANT: DB stores a LocalDateTime (no timezone). We must interpret that LocalDateTime
+     * as the system/local zone (Asia/Kolkata) — not as UTC — otherwise we'll shift the time.
      */
     public Long getTransactionStartEpochMillis(String transactionId) {
         List<RequestResponse> rows = repository.findByTransactionId(transactionId);
         if (rows == null || rows.isEmpty()) return null;
-        // find first non-null startTime
         for (RequestResponse r : rows) {
             if (r.getStartTime() != null) {
-                return r.getStartTime().toInstant(ZoneOffset.UTC).toEpochMilli();
+                // Log what we got (debug)
+                System.out.println("Time is from db: " + r.getStartTime());
+                // Interpret the DB LocalDateTime in the system default zone (likely Asia/Kolkata)
+                return r.getStartTime().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
             }
         }
         return null;
